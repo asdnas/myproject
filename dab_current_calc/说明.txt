@@ -1,0 +1,24 @@
+1. 填系数 — 编辑 dab_current_calc\config.py
+
+  在 MODE_CONFIG["segments"] 里填入你的 8 段参数，每段格式：
+
+  {"v1": a, "v2": b, "time": (c_D1, c_D2, c_phi, c_const)}
+
+  - v1, v2 ∈ {-1, 0, 1}，表示该段原边/副边电压极性
+  - time 的 4 个系数表示 段时间 = (c_D1*D1 + c_D2*D2 + c_phi*φ + c_const) × Th
+
+  电感电流斜率自动由电压系数算出：k = (a*V1 - b*n*V2) / L
+
+  2. 填参数 & 运行 — 编辑 run_example.py 后执行
+
+  修改 EXAMPLE_PARAMS 为你的实际工况（V1、V2、n、L、fs、D1、D2、phi），然后：
+
+  python run_example.py
+
+  程序会自动做四件事：
+  1. 符号推导 I0 的代数表达式（输出 LaTeX，可直接复制到论文）
+  2. 展示 8 段各自的斜率和时间
+  3. 数值计算 拐点电流 I0~I8、各段面积、验证总面积 ≈ 0
+  4. 绘制波形图 电感电流 iL 半周期波形
+
+  当前 config.py 里 8 段系数全是 0（占位符），你得先把自己的模态参数填进去才能跑通。
