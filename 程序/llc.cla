@@ -1,0 +1,1031 @@
+///*-----------------------------------dql-206-------------------------------/
+// *
+// *
+// *  Created on: 2020-12-05
+// *      Author: yzy
+// -------------------------------------------------------------------------*/
+
+#include "DSP2803x_Cla_typedefs.h"
+#include "cla_llc_shared.h"
+#include "eeprom.h"
+#include "DSP2803x_Adc.h"
+#include "DSP2803x_EPWM.h"
+
+/*
+ * Four-mode control pure-computation verification.
+ * Set both enable macros to 0 for normal hardware operation.
+ * TPS_FORCE_MODE: 1=G1, 2=G2, 3=D1, 4=D2.
+ */
+#define TPS_LOGIC_TEST_MODE     0
+#define TPS_FORCE_MODE_TEST     0
+#define TPS_FORCE_MODE          0
+
+#define TPS_TEST_V1             30.0f
+#define TPS_TEST_V2             60.0f
+#define TPS_TEST_VREF           60.0f
+#define TPS_TEST_KP             0.0f
+#define TPS_TEST_KI             0.0f
+
+#define TPS_DEBUG_GROUP         6
+#define TPS_AUTO_BUMPLESS_TEST  0
+#define TPS_TEST_START_MODE     3
+#define TPS_TEST_PI_OUTPUT      1.00f
+
+/*********************************CLA 数据段配置**********************************/
+// 通信变量指定存储到 CLA→CPU 通信RAM（CLA可读写，CPU只读）
+#pragma DATA_SECTION(ClaToCpu,"Cla1ToCpuMsgRAM");
+#pragma DATA_SECTION(CLA_PARA,"Cla1ToCpuMsgRAM");
+#pragma DATA_SECTION(CLA_ULOOP,"Cla1ToCpuMsgRAM");
+//#pragma DATA_SECTION(CLA_ILOOP,"Cla1ToCpuMsgRAM");
+/* Internal control state belongs in CLA data RAM; keep message RAM for CPU-visible outputs. */
+#pragma DATA_SECTION(CLA_TPS,"Cla1DataRam1");
+#pragma DATA_SECTION(cmpa1_cmd,"Cla1ToCpuMsgRAM");
+#pragma DATA_SECTION(cmpa2_cmd,"Cla1ToCpuMsgRAM");
+#pragma DATA_SECTION(cmpa3_cmd,"Cla1ToCpuMsgRAM");
+#pragma DATA_SECTION(cmpa4_cmd,"Cla1ToCpuMsgRAM");
+#pragma DATA_SECTION(tbphs3_cmd,"Cla1ToCpuMsgRAM");
+#pragma DATA_SECTION(tbphs4_cmd,"Cla1ToCpuMsgRAM");
+#pragma DATA_SECTION(phsdir_cmd,"Cla1ToCpuMsgRAM");
+/*********************************核心结构体定义（保留指定内容，删除其他冗余）**********************************/
+typedef struct{
+     float dat[9];
+}ClaToCpuData;
+ClaToCpuData ClaToCpu;//cla到cpu
+
+typedef struct{
+    unsigned int From_CPU[8];
+}ClaAdcData;
+ClaAdcData CLA_PARA;//cpu到cla
+uint32_t cmpa1_cmd;
+uint32_t cmpa2_cmd;
+uint32_t cmpa3_cmd;
+uint32_t cmpa4_cmd;
+uint32_t tbphs3_cmd;
+uint32_t tbphs4_cmd;
+uint32_t phsdir_cmd;
+
+// PI调节结构体（仅删除未使用的冗余成员，保留核心功能，不删除指定内容）
+typedef struct{
+    Uint16 sign;                                       // 给定值（保留，若后续无需使用也可删除）
+    float ref;                                         // 反馈值/参考值
+    float err;                                         // 本次误差
+    float err_last;                                    // 上次误差
+    float out;                                         // PI输出（保留，若后续无需使用也可删除）
+    float out_last;                                    // PI上次输出
+    float errtemp;                                     // 误差变化量（▲err）
+    float itemp;                                       // 积分项中间值
+    float ptemp;                                       // 比例项中间值
+    float outtemp;                                     // PI输出临时值
+    float detout;                                      // PI输出增量
+    float kp;                                          // 比例系数
+    float ki;                                          // 积分系数
+}CLA_PILOOP;
+CLA_PILOOP CLA_ULOOP;
+//CLA_PILOOP CLA_ILOOP;
+
+typedef struct {
+    float K;
+    float k;
+    float D1;
+    float D2;
+    float D3;
+    float D1temp;
+    float D2temp;
+    float D3temp;
+    float M;
+    float Pinput;
+    float moad;
+    float fai1;
+    float fai2;
+    float d21;
+    float d22;
+    float den_G2;
+    float integral;
+    float d1_new;
+    float d2_new;
+    float fai_new;
+    float I_sg;
+    float I_qg;
+    float I_sd;
+    /* Shared Task2 temporaries; Current() owns all six until I_qg is complete. */
+    float tmp1;
+    float tmp2;
+    float tmp3;
+    float tmp4;
+    float tmp5;
+    float tmp6;
+    unsigned int mode_now;
+    unsigned int mode_new;
+    unsigned int auto_test_armed;
+    unsigned int auto_test_done;
+}  CLA_tps;
+CLA_tps CLA_TPS;
+//CLA_tps CLA_TPS;//tps控制结构体
+/******************************CLA CODE LOCATION****************************/
+// 仅保留实际调用的Cla1Task2函数的段声明，删除SPWM相关的冗余声明
+#pragma CODE_SECTION(Cla1Task2, "Cla1Prog");
+/*********************************************************************************/
+/* Name:     my_sqrt_medium()                                                    */
+/* Time:      2026.3.2                                                      */
+/* Parameters: float a (输入值)                                              */
+/* Returns:   float (平方根结果)                                             */
+/* Description: 使用牛顿迭代法计算平方根，4次迭代，精度适中                  */
+/*********************************************************************************/
+float my_sqrt(float a) {
+    if (a <= 0.0f) return 0.0f;
+    float x = a;
+    x = 0.5f * (x + a / x);
+    x = 0.5f * (x + a / x);
+    x = 0.5f * (x + a / x);
+    x = 0.5f * (x + a / x);
+    return x;
+}
+
+/*********************************************************************************/
+/* Description: CLA 可用的绝对值和限幅函数，避免依赖额外运行库。                */
+/*********************************************************************************/
+float cla_abs(float a)
+{
+    if(a < 0.0f)
+    {
+        return -a;
+    }
+    return a;
+}
+
+#if 0
+/* Retired with UpdatePwmCommands(); critical Task2 limits are inline. */
+float cla_limit(float a, float min_value, float max_value)
+{
+    if(a < min_value)
+    {
+        return min_value;
+    }
+    if(a > max_value)
+    {
+        return max_value;
+    }
+    return a;
+}
+#endif
+/*********************************************************************************/
+/* Name:     ReadData_fromCPU()                                                  */
+/* Time:      20201207                                                           */
+/* Parameters:none                                                               */
+/* Returns:   none                                                               */
+/* Description: 从CPU指定RAM地址读取配置参数（vref、kp、ki、TBPRDVAL等）*/
+/*********************************************************************************/
+
+void ReadData_fromCPU()
+{
+    CLA_PARA.From_CPU[0]=*((unsigned int*)0x001500);//vref
+    CLA_PARA.From_CPU[1]=*((unsigned int*)0x001502);//kp
+    CLA_PARA.From_CPU[2]=*((unsigned int*)0x001504);//ki
+    CLA_PARA.From_CPU[3]=*((unsigned int*)0x001506);//TBPRDVAL
+    CLA_PARA.From_CPU[4]=*((unsigned int*)0x001508);//_MC_CLRDATA  确定是否1500开始
+}
+
+/*********************************************************************************/
+/* Name:     SendData_toCPU()                                                    */
+/* Time:      20201207                                                           */
+/* Parameters:none                                                               */
+/* Returns:   none                                                               */
+/* Description: 采集ADC数据并转换为物理量，发送给CPU便于调试和参数调节 */
+/*********************************************************************************/
+void SendData_toCPU()
+{
+
+    ClaToCpu.dat[0] =  (AdcResult.ADCRESULT0 - 2049) * 0.020492;//  vh输出电压1480
+    if(ClaToCpu.dat[0]<0)
+    {ClaToCpu.dat[0]=0.001;}
+    ClaToCpu.dat[1] = AdcResult.ADCRESULT1 * 0.036134 ;//  vdc输入电压1482
+    ClaToCpu.dat[2] = CLA_TPS.D1;//1484
+    ClaToCpu.dat[3] = 1 + CLA_TPS.D2;//86
+    ClaToCpu.dat[4] = CLA_TPS.D3;//88
+    ClaToCpu.dat[5] = CLA_ULOOP.outtemp ;// P*A 8A
+    ClaToCpu.dat[6] = (AdcResult.ADCRESULT6 - 2050) * 0.009555 ; //  ib输出电流 8C
+    ClaToCpu.dat[7] =  (2051 - AdcResult.ADCRESULT7) * 0.009639 ;// ibus输入电流 8E
+    ClaToCpu.dat[8] = CLA_TPS.moad;//90
+}
+
+#if 0
+/* Retired comparison implementation. Runtime Task2 uses the verified inline PWM mapping. */
+void UpdatePwmCommands()
+{
+    float d1;
+    float d2;
+    float fai;
+    float cmpa1_count;
+    float cmpa3_count;
+    float phase_count;
+    uint32_t cmpa1;
+    uint32_t cmpa3;
+    unsigned int phase_direction;
+
+    if(CLA_PARA.From_CPU[4] == 0)
+    {
+        // CPU low-rate path already converted manual inputs to unified d1/fai/d2 format.
+        d1 = *((float*)0x001510);
+        fai = *((float*)0x001512);
+        d2 = *((float*)0x001514);
+    }
+    else
+    {
+        // Automatic mode mapping: D1=d1, D2=fai, D3=d2.
+        d1 = CLA_TPS.D1;
+        fai = CLA_TPS.D2;
+        d2 = CLA_TPS.D3;
+    }
+
+    d1 = cla_limit(d1, 0.0f, 2.0f);
+    d2 = cla_limit(d2, 0.0f, 2.0f);
+    fai = cla_limit(fai, -1.0f, 1.0f);
+
+    // CLA0 handles float limits more efficiently; convert only final PWM commands to integers.
+    cmpa1_count = cla_limit(d1 * 214.0f, 1.0f, 427.0f);
+    cmpa3_count = cla_limit(d2 * 214.0f, 1.0f, 427.0f);
+    cmpa1 = (uint32_t)cmpa1_count;
+    cmpa3 = (uint32_t)cmpa3_count;
+
+    if(fai >= 0.0f)
+    {
+        phase_count = fai * 285.333333f;
+        phase_direction = 0;
+    }
+    else
+    {
+        phase_count = (-fai) * 285.333333f;
+        phase_direction = 1;
+    }
+    phase_count = cla_limit(phase_count, 0.0f, 428.0f);
+
+    cmpa1_cmd = cmpa1;
+    cmpa2_cmd = 428U - cmpa1;
+    cmpa3_cmd = cmpa3;
+    cmpa4_cmd = 428U - cmpa3;
+    tbphs3_cmd = (uint32_t)phase_count;
+    tbphs4_cmd = (uint32_t)phase_count;
+    phsdir_cmd = (uint32_t)phase_direction;
+}
+#endif
+
+/*********************************************************************************/
+/* Name:     __interrupt void Cla1Task2 ( void )                                 */
+/* Time:      20201207                                                           */
+/* Parameters:none                                                               */
+/* Returns:   none                                                               */
+/* Description: CLA核心任务2：实现PI调节和移相比计算，控制EPWM寄存器 */
+/*********************************************************************************/
+__interrupt void Cla1Task2 ( void )
+{
+    // Do not use __mdebugstop() in the runtime task; it can leave MIRUN.INT2 set while debugging.
+//---------------------------------------------------------------------------------
+    ReadData_fromCPU();//从CPU中读取参考电压ref CLA_PARA.From_CPU[0]、kp CLA_PARA.From_CPU[1]、ki CLA_PARA.From_CPU[2]、TBPRD、开启pi标志、adcresult寄存器
+#if !TPS_LOGIC_TEST_MODE
+    SendData_toCPU();//把实际物理量、pi输入——err、pi输出——out给CPU
+#endif
+    CLA_ULOOP.ref = *((unsigned int*)0x001500);//电流环输入指令   CLA_PARA.From_CPU[0]电流环指令
+    CLA_ULOOP.kp = 0.0001 * CLA_PARA.From_CPU[1];//电流环kp
+    CLA_ULOOP.ki = 0.001 * CLA_PARA.From_CPU[2];//电流环ki
+//------------------------------------电压环输入限幅--------------------------------------------------------
+    if(CLA_ULOOP.ref > 20)
+        CLA_ULOOP.ref = 20 ;
+    else if(CLA_ULOOP.ref < 0)
+        CLA_ULOOP.ref = 0;
+
+    if((TPS_LOGIC_TEST_MODE && TPS_AUTO_BUMPLESS_TEST
+        && CLA_PARA.From_CPU[4] == 1 && CLA_TPS.auto_test_done == 0U)
+    || (TPS_LOGIC_TEST_MODE && !TPS_AUTO_BUMPLESS_TEST)
+    || (!TPS_LOGIC_TEST_MODE && CLA_PARA.From_CPU[4] == 1))
+    {
+    //-----------------------------------误差计算------------------------------------------------------------
+        /************************ 新四模式控制逻辑入口 ************************/
+#if TPS_LOGIC_TEST_MODE
+        CLA_TPS.tmp1 = TPS_TEST_V1;
+        CLA_TPS.tmp2 = TPS_TEST_V2;
+        CLA_ULOOP.ref = TPS_TEST_VREF;
+        CLA_ULOOP.kp = TPS_TEST_KP;
+        CLA_ULOOP.ki = TPS_TEST_KI;
+        CLA_ULOOP.err = TPS_TEST_VREF - TPS_TEST_V2;
+        CLA_ULOOP.itemp = 0.000015f * CLA_ULOOP.ki * CLA_ULOOP.err;
+#if TPS_FORCE_MODE_TEST
+        // Pure-computation verification uses deterministic state every cycle.
+        CLA_TPS.mode_now = TPS_FORCE_MODE;
+        CLA_TPS.mode_new = TPS_FORCE_MODE;
+        CLA_TPS.integral = TPS_TEST_PI_OUTPUT;
+#endif
+#if TPS_AUTO_BUMPLESS_TEST
+        if(CLA_TPS.auto_test_done == 0U)
+        {
+            /*
+             * Initialize at the start of every pending one-shot transaction.
+             * auto_test_armed must never block START_MODE initialization.
+             */
+            CLA_TPS.auto_test_armed = TPS_TEST_START_MODE;
+            CLA_TPS.mode_now = TPS_TEST_START_MODE;
+            CLA_TPS.mode_new = TPS_TEST_START_MODE;
+            CLA_TPS.integral = TPS_TEST_PI_OUTPUT;
+            CLA_TPS.d1_new = 0.0f;
+            CLA_TPS.d2_new = 0.0f;
+            CLA_TPS.fai_new = 0.0f;
+
+            if(CLA_TPS.mode_now != 1U
+            && CLA_TPS.mode_now != 2U
+            && CLA_TPS.mode_now != 3U
+            && CLA_TPS.mode_now != 4U)
+            {
+                CLA_TPS.mode_now = TPS_TEST_START_MODE;
+                CLA_TPS.mode_new = TPS_TEST_START_MODE;
+            }
+        }
+#endif
+#else
+        CLA_TPS.tmp1 = ClaToCpu.dat[1];
+        if(CLA_TPS.tmp1 < TPS_CURRENT_MIN_V1_V)
+        {
+            CLA_TPS.tmp1 = TPS_CURRENT_MIN_V1_V;
+        }
+        CLA_TPS.tmp2 = ClaToCpu.dat[0];
+        CLA_ULOOP.err = CLA_ULOOP.ref - CLA_TPS.tmp2; // MATLAB: error_now = Vref - V2
+        CLA_ULOOP.itemp = 0.000015f * CLA_ULOOP.ki * CLA_ULOOP.err;
+#endif
+
+        if(CLA_TPS.mode_now == 0)
+        {
+#if TPS_FORCE_MODE_TEST
+            CLA_TPS.mode_now = TPS_FORCE_MODE;
+#else
+            CLA_TPS.mode_now = 1;
+#endif
+#if TPS_LOGIC_TEST_MODE
+            CLA_TPS.integral = TPS_TEST_PI_OUTPUT;
+#else
+            CLA_TPS.integral = 0.3f;
+#endif
+            CLA_TPS.d1_new = 0.0f;
+#if 0
+            CLA_TPS.mode_now = 1;       // MATLAB persistent mode_now 默认 G1
+            CLA_TPS.integral = 0.3f;    // MATLAB persistent integral 初值
+            CLA_TPS.d1_new = 0.0f;
+#endif
+            CLA_TPS.d2_new = 0.0f;
+            CLA_TPS.fai_new = 0.0f;
+        }
+
+        /**************** MATLAB Current() 电流边界计算移植 ****************/
+#if TPS_LOGIC_TEST_MODE
+        // Pure-computation test uses constants directly; no sampled/local voltage path.
+        CLA_TPS.M = CLA_TPS.tmp2 / CLA_TPS.tmp1;
+        CLA_TPS.tmp3 = (2.0f * CLA_PARA.From_CPU[3]) / TPS_PWM_TBCLK_HZ; // Ts=2*TBPRD/TBCLK
+        if(CLA_TPS.tmp3 < TPS_CURRENT_MIN_TS_S)
+        {
+            CLA_TPS.tmp3 = TPS_CURRENT_MIN_TS_S;
+        }
+        CLA_TPS.tmp4 = TPS_CURRENT_TD_RATIO * CLA_TPS.tmp3; // Td1=Td2
+        CLA_TPS.tmp5 = TPS_CURRENT_L_H;
+        if(cla_abs(CLA_TPS.tmp5) < TPS_CURRENT_MIN_L_H)
+        {
+            CLA_TPS.tmp5 = TPS_CURRENT_MIN_L_H;
+        }
+        CLA_TPS.tmp6 = (CLA_TPS.tmp1 * CLA_TPS.tmp3) / (4.0f * CLA_TPS.tmp5); // current_IN
+        if(cla_abs(CLA_TPS.tmp6) < TPS_CURRENT_MIN_IN)
+        {
+            CLA_TPS.tmp6 = TPS_CURRENT_MIN_IN;
+        }
+        CLA_TPS.tmp6 = CLA_TPS.tmp5 * CLA_TPS.tmp6; // current_den
+        if(cla_abs(CLA_TPS.tmp6) < TPS_CURRENT_MIN_DEN)
+        {
+            CLA_TPS.tmp6 = TPS_CURRENT_MIN_DEN;
+        }
+        CLA_TPS.I_sg = (CLA_TPS.tmp1 * CLA_TPS.tmp4) / CLA_TPS.tmp6;
+        CLA_TPS.I_sd = ((CLA_TPS.tmp1 + TPS_TRANSFORMER_N * CLA_TPS.tmp2)
+                     * CLA_TPS.tmp4) / CLA_TPS.tmp6;
+        if(CLA_TPS.M > 1.0f && CLA_TPS.M < 2.0f)
+        {
+            CLA_TPS.I_qg = (CLA_TPS.tmp1 * CLA_TPS.tmp4) / CLA_TPS.tmp6;
+        }
+        else if(CLA_TPS.M >= 2.0f)
+        {
+            CLA_TPS.I_qg = ((TPS_TRANSFORMER_N * CLA_TPS.tmp2 - CLA_TPS.tmp1)
+                         * CLA_TPS.tmp4) / CLA_TPS.tmp6;
+        }
+        else
+        {
+            CLA_TPS.I_qg = 0.2f;
+        }
+
+#else
+        CLA_TPS.M = CLA_TPS.tmp2 / CLA_TPS.tmp1;
+        CLA_TPS.tmp3 = (2.0f * CLA_PARA.From_CPU[3]) / TPS_PWM_TBCLK_HZ;
+        if(CLA_TPS.tmp3 < TPS_CURRENT_MIN_TS_S)
+        {
+            CLA_TPS.tmp3 = TPS_CURRENT_MIN_TS_S;
+        }
+        CLA_TPS.tmp4 = TPS_CURRENT_TD_RATIO * CLA_TPS.tmp3;
+        CLA_TPS.tmp5 = TPS_CURRENT_L_H;
+        if(cla_abs(CLA_TPS.tmp5) < TPS_CURRENT_MIN_L_H)
+        {
+            CLA_TPS.tmp5 = TPS_CURRENT_MIN_L_H;
+        }
+        CLA_TPS.tmp6 = (CLA_TPS.tmp1 * CLA_TPS.tmp3) / (4.0f * CLA_TPS.tmp5);
+        if(cla_abs(CLA_TPS.tmp6) < TPS_CURRENT_MIN_IN)
+        {
+            CLA_TPS.tmp6 = TPS_CURRENT_MIN_IN;
+        }
+        CLA_TPS.tmp6 = CLA_TPS.tmp5 * CLA_TPS.tmp6;
+        if(cla_abs(CLA_TPS.tmp6) < TPS_CURRENT_MIN_DEN)
+        {
+            CLA_TPS.tmp6 = TPS_CURRENT_MIN_DEN;
+        }
+        CLA_TPS.I_sg = (CLA_TPS.tmp1 * CLA_TPS.tmp4) / CLA_TPS.tmp6;
+        CLA_TPS.I_sd = ((CLA_TPS.tmp1 + TPS_TRANSFORMER_N * CLA_TPS.tmp2)
+                     * CLA_TPS.tmp4) / CLA_TPS.tmp6;
+        if(CLA_TPS.M > 1.0f && CLA_TPS.M < 2.0f)
+        {
+            CLA_TPS.I_qg = (CLA_TPS.tmp1 * CLA_TPS.tmp4) / CLA_TPS.tmp6;
+        }
+        else if(CLA_TPS.M >= 2.0f)
+        {
+            CLA_TPS.I_qg = ((TPS_TRANSFORMER_N * CLA_TPS.tmp2 - CLA_TPS.tmp1)
+                         * CLA_TPS.tmp4) / CLA_TPS.tmp6;
+        }
+        else
+        {
+            CLA_TPS.I_qg = 0.2f;
+        }
+#endif
+        /******** MATLAB 输出预分配：先输出上一周期状态，再计算下一周期状态 ********/
+        CLA_TPS.D1 = CLA_TPS.d1_new; // PWM 接口 D1 对应 MATLAB d1
+        if(CLA_TPS.D1 < 0.0001f)
+        {
+            CLA_TPS.D1 = 0.0001f;
+        }
+        else if(CLA_TPS.D1 > 1.0f)
+        {
+            CLA_TPS.D1 = 1.0f;
+        }
+
+        CLA_TPS.D3 = CLA_TPS.d2_new; // PWM 接口 D3 对应 MATLAB d2
+        if(CLA_TPS.D3 < 0.0001f)
+        {
+            CLA_TPS.D3 = 0.0001f;
+        }
+        else if(CLA_TPS.D3 > 1.0f)
+        {
+            CLA_TPS.D3 = 1.0f;
+        }
+
+        CLA_TPS.D2 = CLA_TPS.fai_new; // PWM 接口 D2 对应 MATLAB fai/phi
+        if(CLA_TPS.D2 < 0.0f)
+        {
+            CLA_TPS.D2 = 0.0f;
+        }
+        else if(CLA_TPS.D2 > 0.5f)
+        {
+            CLA_TPS.D2 = 0.5f;
+        }
+
+        /************************ MATLAB 基础量公式 ************************/
+        if(cla_abs(CLA_TPS.M - 1.0f) < 0.000001f)
+        {
+            if(CLA_TPS.M < 1.0f)
+            {
+                CLA_TPS.M = 0.999999f;
+            }
+            else
+            {
+                CLA_TPS.M = 1.000001f;
+            }
+        }
+        CLA_TPS.fai1 = ((CLA_TPS.M - 1.0f) * (1.0f - CLA_TPS.I_sg)
+                      - CLA_TPS.I_qg * CLA_TPS.M) / (2.0f * CLA_TPS.M);
+        CLA_TPS.fai2 = (CLA_TPS.M - 1.0f + CLA_TPS.I_sd) / (2.0f * CLA_TPS.M);
+        CLA_TPS.den_G2 = (CLA_TPS.M - 1.0f) * CLA_TPS.I_sg
+                       + CLA_TPS.I_sd + CLA_TPS.I_qg * CLA_TPS.M;
+        if(cla_abs(CLA_TPS.den_G2) < 0.000000001f)
+        {
+            CLA_TPS.den_G2 = 0.000000001f; // MATLAB den_G2 除零保护
+        }
+//        CLA_TPS.d21 = 2.0f * (CLA_TPS.I_sg - CLA_TPS.I_sd)
+//                    * (CLA_TPS.fai2 - CLA_TPS.fai1) / CLA_TPS.den_G2
+//                    + (1.0f - CLA_TPS.I_sg) / CLA_TPS.M;
+        CLA_TPS.tmp3 = 2.0f * (CLA_TPS.I_sg - CLA_TPS.I_sd)
+                     * (CLA_TPS.fai2 - CLA_TPS.fai1) / CLA_TPS.den_G2;
+        CLA_TPS.d21 = CLA_TPS.tmp3 + (1.0f - CLA_TPS.I_sg) / CLA_TPS.M;
+        CLA_TPS.tmp3 = (CLA_TPS.I_sd - 1.0f) / CLA_TPS.M;
+        CLA_TPS.d22 = CLA_TPS.I_sd
+                    + my_sqrt(CLA_TPS.I_sd * CLA_TPS.I_sd + CLA_TPS.tmp3 * CLA_TPS.tmp3);
+
+#if TPS_LOGIC_TEST_MODE
+        /*
+         * Final test-mode error guard before every downstream consumer:
+         * mode calculation, bumpless transfer and next-cycle output.
+         */
+        CLA_ULOOP.err = TPS_TEST_VREF - TPS_TEST_V2;
+        CLA_ULOOP.itemp = 0.000015f * CLA_ULOOP.ki * CLA_ULOOP.err;
+#endif
+        CLA_TPS.tmp1 = CLA_ULOOP.kp * CLA_ULOOP.err + CLA_TPS.integral; // fai_now
+        CLA_TPS.tmp2 = 0.0f; // d2_now
+
+#if TPS_FORCE_MODE_TEST
+        // Force the selected formula without bypassing its normal calculations.
+        CLA_TPS.mode_now = TPS_FORCE_MODE;
+        CLA_TPS.mode_new = TPS_FORCE_MODE;
+#endif
+
+#if 0
+        if(CLA_TPS.auto_test_done == 0U)
+        {
+            // Snapshot before automatic switching: tmp3=d1, tmp4=d2, tmp5=fai.
+            /*
+             * Force initialization again at the exact transaction boundary.
+             * Keep before mode in CLA data RAM; CLA local integer snapshots
+             * were observed as zero on hardware.
+             */
+            CLA_TPS.mode_now = TPS_TEST_START_MODE;
+            CLA_TPS.mode_new = TPS_TEST_START_MODE;
+            CLA_TPS.integral = TPS_TEST_PI_OUTPUT;
+            CLA_TPS.d1_new = 0.0f;
+            CLA_TPS.d2_new = 0.0f;
+            CLA_TPS.fai_new = 0.0f;
+            CLA_TPS.auto_test_armed = CLA_TPS.mode_now;
+            CLA_TPS.tmp5 = CLA_TPS.tmp1;
+            if(CLA_TPS.auto_test_armed == 1U)
+            {
+                CLA_TPS.tmp3 = cla_abs((2.0f * CLA_TPS.M * CLA_TPS.tmp5
+                               + CLA_TPS.I_qg * CLA_TPS.M) / (CLA_TPS.M - 1.0f)
+                               + CLA_TPS.I_sg);
+                CLA_TPS.tmp4 = cla_abs((2.0f * CLA_TPS.M + CLA_TPS.I_qg)
+                               / (CLA_TPS.M - 1.0f));
+            }
+            else if(CLA_TPS.auto_test_armed == 2U)
+            {
+                CLA_TPS.tmp3 = 1.0f;
+                CLA_TPS.tmp4 = cla_abs(2.0f * (CLA_TPS.I_sg - CLA_TPS.I_sd)
+                               * (CLA_TPS.tmp5 - CLA_TPS.fai1) / CLA_TPS.den_G2
+                               + (1.0f - CLA_TPS.I_sg) / CLA_TPS.M);
+            }
+            else if(CLA_TPS.auto_test_armed == 3U)
+            {
+                CLA_TPS.tmp3 = 1.0f;
+                CLA_TPS.tmp4 = cla_abs(CLA_TPS.tmp5);
+                CLA_TPS.tmp5 = CLA_TPS.fai2;
+            }
+            else
+            {
+                CLA_TPS.tmp3 = 1.0f;
+                CLA_TPS.tmp6 = 2.0f * CLA_TPS.tmp5 - 1.0f;
+                CLA_TPS.tmp4 = cla_abs(1.0f + CLA_TPS.M * CLA_TPS.tmp6
+                               + my_sqrt((CLA_TPS.M * CLA_TPS.tmp6 + 1.0f)
+                               * (CLA_TPS.M * CLA_TPS.tmp6 + 1.0f)
+                               + CLA_TPS.tmp6 * CLA_TPS.tmp6));
+            }
+
+            if(CLA_TPS.tmp3 < 0.0001f) CLA_TPS.tmp3 = 0.0001f;
+            else if(CLA_TPS.tmp3 > 1.0f) CLA_TPS.tmp3 = 1.0f;
+            if(CLA_TPS.tmp4 < 0.0001f) CLA_TPS.tmp4 = 0.0001f;
+            else if(CLA_TPS.tmp4 > 1.0f) CLA_TPS.tmp4 = 1.0f;
+            if(CLA_TPS.tmp5 < 0.0f) CLA_TPS.tmp5 = 0.0f;
+            else if(CLA_TPS.tmp5 > 0.5f) CLA_TPS.tmp5 = 0.5f;
+
+            // Preserve the complete before snapshot until dat[0..8] is written together.
+            CLA_TPS.D1temp = CLA_TPS.tmp3;
+            CLA_TPS.D2temp = CLA_TPS.tmp4;
+            CLA_TPS.D3temp = CLA_TPS.tmp5;
+        }
+#endif
+
+        /************************ MATLAB 当前模式计算 ************************/
+        if(CLA_TPS.mode_now == 1)
+        {
+            CLA_TPS.tmp2 = cla_abs((2.0f * CLA_TPS.M + CLA_TPS.I_qg) / (CLA_TPS.M - 1.0f));
+        }
+        else if(CLA_TPS.mode_now == 2)
+        {
+            CLA_TPS.tmp2 = cla_abs(2.0f * (CLA_TPS.I_sg - CLA_TPS.I_sd)
+                   * (CLA_TPS.tmp1 - CLA_TPS.fai1) / CLA_TPS.den_G2
+                   + (1.0f - CLA_TPS.I_sg) / CLA_TPS.M);
+        }
+        else if(CLA_TPS.mode_now == 3)
+        {
+            CLA_TPS.tmp2 = cla_abs(CLA_TPS.tmp1);
+            CLA_TPS.tmp1 = CLA_TPS.fai2;
+        }
+        else
+        {
+            CLA_TPS.tmp3 = 2.0f * CLA_TPS.tmp1 - 1.0f;
+            CLA_TPS.tmp2 = cla_abs(1.0f + CLA_TPS.M * CLA_TPS.tmp3
+                   + my_sqrt((CLA_TPS.M * CLA_TPS.tmp3 + 1.0f) * (CLA_TPS.M * CLA_TPS.tmp3 + 1.0f)
+                   + CLA_TPS.tmp3 * CLA_TPS.tmp3));
+        }
+
+        /************************ MATLAB 自动模式切换 ************************/
+#if TPS_LOGIC_TEST_MODE && TPS_AUTO_BUMPLESS_TEST && TPS_DEBUG_GROUP == 6
+        if(CLA_TPS.auto_test_done == 0U)
+        {
+            CLA_TPS.D1temp = (float)CLA_TPS.mode_now; // mode_before
+            CLA_TPS.Pinput = CLA_TPS.tmp1;            // fai_before
+
+            if(CLA_TPS.mode_now == 1U)
+            {
+                CLA_TPS.K = cla_abs((2.0f * CLA_TPS.M * CLA_TPS.Pinput
+                          + CLA_TPS.I_qg * CLA_TPS.M) / (CLA_TPS.M - 1.0f)
+                          + CLA_TPS.I_sg);
+                CLA_TPS.k = cla_abs((2.0f * CLA_TPS.M + CLA_TPS.I_qg)
+                          / (CLA_TPS.M - 1.0f));
+            }
+            else if(CLA_TPS.mode_now == 2U)
+            {
+                CLA_TPS.K = 1.0f;
+                CLA_TPS.k = cla_abs(2.0f * (CLA_TPS.I_sg - CLA_TPS.I_sd)
+                          * (CLA_TPS.Pinput - CLA_TPS.fai1) / CLA_TPS.den_G2
+                          + (1.0f - CLA_TPS.I_sg) / CLA_TPS.M);
+            }
+            else if(CLA_TPS.mode_now == 3U)
+            {
+                CLA_TPS.K = 1.0f;
+                CLA_TPS.k = cla_abs(CLA_TPS.Pinput);
+                CLA_TPS.Pinput = CLA_TPS.fai2;
+            }
+            else
+            {
+                CLA_TPS.K = 1.0f;
+                CLA_TPS.tmp6 = 2.0f * CLA_TPS.Pinput - 1.0f;
+                CLA_TPS.k = cla_abs(1.0f + CLA_TPS.M * CLA_TPS.tmp6
+                          + my_sqrt((CLA_TPS.M * CLA_TPS.tmp6 + 1.0f)
+                          * (CLA_TPS.M * CLA_TPS.tmp6 + 1.0f)
+                          + CLA_TPS.tmp6 * CLA_TPS.tmp6));
+            }
+
+            if(CLA_TPS.K < 0.0001f) CLA_TPS.K = 0.0001f;
+            else if(CLA_TPS.K > 1.0f) CLA_TPS.K = 1.0f;
+            if(CLA_TPS.k < 0.0001f) CLA_TPS.k = 0.0001f;
+            else if(CLA_TPS.k > 1.0f) CLA_TPS.k = 1.0f;
+            if(CLA_TPS.Pinput < 0.0f) CLA_TPS.Pinput = 0.0f;
+            else if(CLA_TPS.Pinput > 0.5f) CLA_TPS.Pinput = 0.5f;
+        }
+#endif
+
+#if TPS_FORCE_MODE_TEST
+        CLA_TPS.mode_now = TPS_FORCE_MODE;
+        CLA_TPS.mode_new = TPS_FORCE_MODE;
+#else
+#if TPS_LOGIC_TEST_MODE && TPS_AUTO_BUMPLESS_TEST
+        if(CLA_TPS.auto_test_done == 0U)
+        {
+#endif
+        CLA_TPS.mode_new = CLA_TPS.mode_now;
+        if(CLA_TPS.mode_now == 1 && CLA_TPS.tmp1 > CLA_TPS.fai1)
+        {
+            CLA_TPS.mode_new = 2;
+        }
+        else if(CLA_TPS.mode_now == 2)
+        {
+            if(CLA_TPS.tmp1 < CLA_TPS.fai1)
+            {
+                CLA_TPS.mode_new = 1;
+            }
+            else if(CLA_TPS.tmp1 >= CLA_TPS.fai2)
+            {
+                CLA_TPS.tmp1 = CLA_TPS.fai2;
+                CLA_TPS.mode_new = 3;
+            }
+        }
+        else if(CLA_TPS.mode_now == 3)
+        {
+            if(CLA_TPS.tmp2 >= CLA_TPS.d22)
+            {
+                CLA_TPS.mode_new = 4;
+            }
+            else if(CLA_TPS.tmp2 < CLA_TPS.d21)
+            {
+                CLA_TPS.mode_new = 2;
+            }
+        }
+        else if(CLA_TPS.mode_now == 4 && CLA_TPS.tmp1 <= CLA_TPS.fai2)
+        {
+            CLA_TPS.tmp1 = CLA_TPS.fai2;
+            CLA_TPS.mode_new = 3;
+        }
+#if TPS_LOGIC_TEST_MODE && TPS_AUTO_BUMPLESS_TEST
+        }
+        else
+        {
+            CLA_TPS.mode_new = CLA_TPS.mode_now;
+        }
+#endif
+
+        /******** MATLAB bumpless transfer：非 G1/G2 相邻切换时重置积分状态 ********/
+#endif
+        if(CLA_TPS.mode_new != CLA_TPS.mode_now
+        && !((CLA_TPS.mode_now == 1 && CLA_TPS.mode_new == 2)
+          || (CLA_TPS.mode_now == 2 && CLA_TPS.mode_new == 1)))
+        {
+            CLA_TPS.tmp4 = 0.0f;
+            if(CLA_TPS.mode_new == 2 || CLA_TPS.mode_new == 4)
+            {
+                CLA_TPS.tmp4 = CLA_TPS.tmp1;
+            }
+            else if(CLA_TPS.mode_new == 3)
+            {
+                CLA_TPS.tmp4 = CLA_TPS.tmp2;
+            }
+            CLA_TPS.integral = CLA_TPS.tmp4 - CLA_ULOOP.kp * CLA_ULOOP.err;
+        }
+        else
+        {
+            CLA_TPS.integral = CLA_TPS.integral + CLA_ULOOP.itemp;
+        }
+        CLA_TPS.mode_now = CLA_TPS.mode_new;
+
+#if TPS_LOGIC_TEST_MODE && TPS_AUTO_BUMPLESS_TEST && TPS_DEBUG_GROUP == 6
+        if(CLA_TPS.auto_test_done == 0U)
+        {
+            CLA_TPS.D2temp = (float)CLA_TPS.mode_now; // mode_after
+            CLA_TPS.D3temp = 10.0f * CLA_TPS.D1temp + CLA_TPS.D2temp;
+            CLA_TPS.tmp5 = CLA_ULOOP.kp * CLA_ULOOP.err + CLA_TPS.integral; // fai_after
+
+            if(CLA_TPS.mode_now == 1U)
+            {
+                CLA_TPS.tmp3 = cla_abs((2.0f * CLA_TPS.M * CLA_TPS.tmp5
+                             + CLA_TPS.I_qg * CLA_TPS.M) / (CLA_TPS.M - 1.0f)
+                             + CLA_TPS.I_sg);
+                CLA_TPS.tmp4 = cla_abs((2.0f * CLA_TPS.M + CLA_TPS.I_qg)
+                             / (CLA_TPS.M - 1.0f));
+            }
+            else if(CLA_TPS.mode_now == 2U)
+            {
+                CLA_TPS.tmp3 = 1.0f;
+                CLA_TPS.tmp4 = cla_abs(2.0f * (CLA_TPS.I_sg - CLA_TPS.I_sd)
+                             * (CLA_TPS.tmp5 - CLA_TPS.fai1) / CLA_TPS.den_G2
+                             + (1.0f - CLA_TPS.I_sg) / CLA_TPS.M);
+            }
+            else if(CLA_TPS.mode_now == 3U)
+            {
+                CLA_TPS.tmp3 = 1.0f;
+                CLA_TPS.tmp4 = cla_abs(CLA_TPS.tmp5);
+                CLA_TPS.tmp5 = CLA_TPS.fai2;
+            }
+            else
+            {
+                CLA_TPS.tmp3 = 1.0f;
+                CLA_TPS.tmp6 = 2.0f * CLA_TPS.tmp5 - 1.0f;
+                CLA_TPS.tmp4 = cla_abs(1.0f + CLA_TPS.M * CLA_TPS.tmp6
+                             + my_sqrt((CLA_TPS.M * CLA_TPS.tmp6 + 1.0f)
+                             * (CLA_TPS.M * CLA_TPS.tmp6 + 1.0f)
+                             + CLA_TPS.tmp6 * CLA_TPS.tmp6));
+            }
+
+            if(CLA_TPS.tmp3 < 0.0001f) CLA_TPS.tmp3 = 0.0001f;
+            else if(CLA_TPS.tmp3 > 1.0f) CLA_TPS.tmp3 = 1.0f;
+            if(CLA_TPS.tmp4 < 0.0001f) CLA_TPS.tmp4 = 0.0001f;
+            else if(CLA_TPS.tmp4 > 1.0f) CLA_TPS.tmp4 = 1.0f;
+            if(CLA_TPS.tmp5 < 0.0f) CLA_TPS.tmp5 = 0.0f;
+            else if(CLA_TPS.tmp5 > 0.5f) CLA_TPS.tmp5 = 0.5f;
+
+            ClaToCpu.dat[0] = CLA_TPS.D1temp;
+            ClaToCpu.dat[1] = CLA_TPS.K;
+            ClaToCpu.dat[2] = CLA_TPS.k;
+            ClaToCpu.dat[3] = CLA_TPS.Pinput;
+            ClaToCpu.dat[4] = CLA_TPS.D2temp;
+            ClaToCpu.dat[5] = CLA_TPS.tmp3;
+            ClaToCpu.dat[6] = CLA_TPS.tmp4;
+            ClaToCpu.dat[7] = CLA_TPS.tmp5;
+            ClaToCpu.dat[8] = CLA_TPS.D3temp;
+            CLA_TPS.auto_test_done = 1U;
+        }
+#endif
+
+        /************************ MATLAB 下一周期输出计算 ************************/
+#if !(TPS_LOGIC_TEST_MODE && TPS_AUTO_BUMPLESS_TEST)
+        CLA_TPS.fai_new = CLA_ULOOP.kp * CLA_ULOOP.err + CLA_TPS.integral;
+        if(CLA_TPS.mode_now == 1)
+        {
+            CLA_TPS.d1_new = cla_abs((2.0f * CLA_TPS.M * CLA_TPS.D2
+                           + CLA_TPS.I_qg * CLA_TPS.M) / (CLA_TPS.M - 1.0f)
+                           + CLA_TPS.I_sg);
+            CLA_TPS.d2_new = cla_abs((2.0f * CLA_TPS.M + CLA_TPS.I_qg)
+                           / (CLA_TPS.M - 1.0f));
+        }
+        else if(CLA_TPS.mode_now == 2)
+        {
+            CLA_TPS.d1_new = 1.0f;
+            CLA_TPS.tmp3 = 2.0f * (CLA_TPS.I_sg - CLA_TPS.I_sd)
+                         * (CLA_TPS.D2 - CLA_TPS.fai1) / CLA_TPS.den_G2;
+            CLA_TPS.tmp4 = (1.0f - CLA_TPS.I_sg) / CLA_TPS.M;
+            CLA_TPS.d2_new = cla_abs(CLA_TPS.tmp3 + CLA_TPS.tmp4);
+        }
+        else if(CLA_TPS.mode_now == 3)
+        {
+            CLA_TPS.d1_new = 1.0f;
+            CLA_TPS.d2_new = cla_abs(CLA_ULOOP.kp * CLA_ULOOP.err + CLA_TPS.integral);
+            CLA_TPS.fai_new = CLA_TPS.fai2;
+        }
+        else
+        {
+            CLA_TPS.d1_new = 1.0f;
+            CLA_TPS.tmp3 = 2.0f * CLA_TPS.D2 - 1.0f;
+            CLA_TPS.d2_new = cla_abs(1.0f + CLA_TPS.M * CLA_TPS.tmp3
+                           + my_sqrt((CLA_TPS.M * CLA_TPS.tmp3 + 1.0f)
+                           * (CLA_TPS.M * CLA_TPS.tmp3 + 1.0f)
+                           + CLA_TPS.tmp3 * CLA_TPS.tmp3));
+        }
+
+        /******** 所有下一周期控制量也限幅，防止异常工况污染 persistent 状态 ********/
+        if(CLA_TPS.d1_new < 0.0001f)
+        {
+            CLA_TPS.d1_new = 0.0001f;
+        }
+        else if(CLA_TPS.d1_new > 1.0f)
+        {
+            CLA_TPS.d1_new = 1.0f;
+        }
+
+        if(CLA_TPS.d2_new < 0.0001f)
+        {
+            CLA_TPS.d2_new = 0.0001f;
+        }
+        else if(CLA_TPS.d2_new > 1.0f)
+        {
+            CLA_TPS.d2_new = 1.0f;
+        }
+
+        if(CLA_TPS.fai_new < 0.0f)
+        {
+            CLA_TPS.fai_new = 0.0f;
+        }
+        else if(CLA_TPS.fai_new > 0.5f)
+        {
+            CLA_TPS.fai_new = 0.5f;
+        }
+        CLA_ULOOP.outtemp = CLA_TPS.fai_new;
+        CLA_TPS.moad = CLA_TPS.mode_now;
+#endif
+
+#if 0
+        if(CLA_TPS.auto_test_done == 0U)
+        {
+            // Direct post-bumpless snapshot; do not use D2 or next-cycle outputs.
+            CLA_TPS.tmp5 = CLA_ULOOP.kp * CLA_ULOOP.err + CLA_TPS.integral;
+            if(CLA_TPS.mode_now == 1U)
+            {
+                CLA_TPS.tmp3 = cla_abs((2.0f * CLA_TPS.M * CLA_TPS.tmp5
+                             + CLA_TPS.I_qg * CLA_TPS.M) / (CLA_TPS.M - 1.0f)
+                             + CLA_TPS.I_sg);
+                CLA_TPS.tmp4 = cla_abs((2.0f * CLA_TPS.M + CLA_TPS.I_qg)
+                             / (CLA_TPS.M - 1.0f));
+            }
+            else if(CLA_TPS.mode_now == 2U)
+            {
+                CLA_TPS.tmp3 = 1.0f;
+                CLA_TPS.tmp4 = cla_abs(2.0f * (CLA_TPS.I_sg - CLA_TPS.I_sd)
+                             * (CLA_TPS.tmp5 - CLA_TPS.fai1) / CLA_TPS.den_G2
+                             + (1.0f - CLA_TPS.I_sg) / CLA_TPS.M);
+            }
+            else if(CLA_TPS.mode_now == 3U)
+            {
+                CLA_TPS.tmp3 = 1.0f;
+                CLA_TPS.tmp4 = cla_abs(CLA_TPS.tmp5);
+                CLA_TPS.tmp5 = CLA_TPS.fai2;
+            }
+            else
+            {
+                CLA_TPS.tmp3 = 1.0f;
+                CLA_TPS.tmp6 = 2.0f * CLA_TPS.tmp5 - 1.0f;
+                CLA_TPS.tmp4 = cla_abs(1.0f + CLA_TPS.M * CLA_TPS.tmp6
+                             + my_sqrt((CLA_TPS.M * CLA_TPS.tmp6 + 1.0f)
+                             * (CLA_TPS.M * CLA_TPS.tmp6 + 1.0f)
+                             + CLA_TPS.tmp6 * CLA_TPS.tmp6));
+            }
+
+            if(CLA_TPS.tmp3 < 0.0001f) CLA_TPS.tmp3 = 0.0001f;
+            else if(CLA_TPS.tmp3 > 1.0f) CLA_TPS.tmp3 = 1.0f;
+            if(CLA_TPS.tmp4 < 0.0001f) CLA_TPS.tmp4 = 0.0001f;
+            else if(CLA_TPS.tmp4 > 1.0f) CLA_TPS.tmp4 = 1.0f;
+            if(CLA_TPS.tmp5 < 0.0f) CLA_TPS.tmp5 = 0.0f;
+            else if(CLA_TPS.tmp5 > 0.5f) CLA_TPS.tmp5 = 0.5f;
+
+            // Commit the complete before/after snapshot atomically.
+            ClaToCpu.dat[0] = (float)CLA_TPS.auto_test_armed;
+            ClaToCpu.dat[1] = CLA_TPS.D1temp;
+            ClaToCpu.dat[2] = CLA_TPS.D2temp;
+            ClaToCpu.dat[3] = CLA_TPS.D3temp;
+            ClaToCpu.dat[4] = (float)CLA_TPS.mode_now;
+            ClaToCpu.dat[5] = CLA_TPS.tmp3;
+            ClaToCpu.dat[6] = CLA_TPS.tmp4;
+            ClaToCpu.dat[7] = CLA_TPS.tmp5;
+            ClaToCpu.dat[8] = (float)(10U * CLA_TPS.auto_test_armed + CLA_TPS.mode_now);
+            CLA_TPS.auto_test_done = 1U;
+        }
+#endif
+
+    }
+    else if(CLA_PARA.From_CPU[4]==0)
+    {
+        // 清零PI核心中间参数
+        CLA_ULOOP.err = 0.0f;
+        CLA_ULOOP.err_last = 0.0f;
+        CLA_ULOOP.errtemp = 0.0f;
+        CLA_ULOOP.ptemp = 0.0f;
+        CLA_ULOOP.itemp = 0.0f;
+        CLA_ULOOP.detout = 0.0f;
+        CLA_ULOOP.outtemp = 0.0f;
+        CLA_ULOOP.out_last = 0.0f;
+        // 清零三移相计算中间参数
+        CLA_TPS.Pinput = 0.0f;
+        CLA_TPS.K = 0.0f;
+        CLA_TPS.M = 0.0f;
+        CLA_TPS.D1temp = 0.0f;
+        CLA_TPS.D2temp = 0.0f;
+        CLA_TPS.D3temp = 0.0f;
+        CLA_TPS.D1 = 0.0f;
+        CLA_TPS.D2 = 0.0f;
+        CLA_TPS.D3 = 0.0f;
+        CLA_TPS.k=0.0f;
+        CLA_TPS.moad=9.0f;
+        // 清零 MATLAB fourModeSwitch 移植后新增的 persistent 状态
+        CLA_TPS.fai1 = 0.0f;
+        CLA_TPS.fai2 = 0.0f;
+        CLA_TPS.d21 = 0.0f;
+        CLA_TPS.d22 = 0.0f;
+        CLA_TPS.den_G2 = 0.0f;
+        CLA_TPS.integral = 0.3f;
+        CLA_TPS.d1_new = 0.0f;
+        CLA_TPS.d2_new = 0.0f;
+        CLA_TPS.fai_new = 0.0f;
+        CLA_TPS.I_sg = 0.0f;
+        CLA_TPS.I_qg = 0.0f;
+        CLA_TPS.I_sd = 0.0f;
+        CLA_TPS.mode_now = 1;
+        CLA_TPS.mode_new = 1;
+        CLA_TPS.auto_test_armed = 0U;
+        CLA_TPS.auto_test_done = 0U;
+//        // 清零移相比寄存器
+//        EPwm3Regs.TBPHS.half.TBPHS = 0;
+//        EPwm2Regs.TBPHS.half.TBPHS = 0;
+//        EPwm4Regs.TBPHS.half.TBPHS = 0;
+    }
+
+    // Publish integer commands for the next 70kHz CPU ISR cycle.
+#if TPS_LOGIC_TEST_MODE
+    // Pure-computation test: safe 50% duty and zero phase.
+    cmpa1_cmd = 214U;
+    cmpa2_cmd = 214U;
+    cmpa3_cmd = 214U;
+    cmpa4_cmd = 214U;
+    tbphs3_cmd = 0U;
+    tbphs4_cmd = 0U;
+    phsdir_cmd = 0U;
+#else
+    // Keep this mapping inline in Task2: calling UpdatePwmCommands() stalls the CLA.
+    {
+        float pwm_d1 = CLA_TPS.D1;
+        float pwm_d2 = CLA_TPS.D3;
+        float pwm_fai = CLA_TPS.D2;
+        float pwm_cmpa1_count;
+        float pwm_cmpa3_count;
+        float pwm_phase_count;
+        uint32_t pwm_cmpa1;
+        uint32_t pwm_cmpa3;
+        uint32_t pwm_phase_direction;
+
+        if(pwm_d1 < 0.0f) pwm_d1 = 0.0f;
+        if(pwm_d1 > 2.0f) pwm_d1 = 2.0f;
+        if(pwm_d2 < 0.0f) pwm_d2 = 0.0f;
+        if(pwm_d2 > 2.0f) pwm_d2 = 2.0f;
+        if(pwm_fai < -1.0f) pwm_fai = -1.0f;
+        if(pwm_fai > 1.0f) pwm_fai = 1.0f;
+
+        pwm_cmpa1_count = pwm_d1 * 214.0f;
+        if(pwm_cmpa1_count < 1.0f) pwm_cmpa1_count = 1.0f;
+        if(pwm_cmpa1_count > 427.0f) pwm_cmpa1_count = 427.0f;
+        pwm_cmpa3_count = pwm_d2 * 214.0f;
+        if(pwm_cmpa3_count < 1.0f) pwm_cmpa3_count = 1.0f;
+        if(pwm_cmpa3_count > 427.0f) pwm_cmpa3_count = 427.0f;
+        pwm_cmpa1 = (uint32_t)pwm_cmpa1_count;
+        pwm_cmpa3 = (uint32_t)pwm_cmpa3_count;
+
+        if(pwm_fai >= 0.0f)
+        {
+            pwm_phase_count = pwm_fai * 285.333333f;
+            pwm_phase_direction = 0U;
+        }
+        else
+        {
+            pwm_phase_count = (-pwm_fai) * 285.333333f;
+            pwm_phase_direction = 1U;
+        }
+        if(pwm_phase_count < 0.0f) pwm_phase_count = 0.0f;
+        if(pwm_phase_count > 428.0f) pwm_phase_count = 428.0f;
+
+        cmpa1_cmd = pwm_cmpa1;
+        cmpa2_cmd = 428U - pwm_cmpa1;
+        cmpa3_cmd = pwm_cmpa3;
+        cmpa4_cmd = 428U - pwm_cmpa3;
+        tbphs3_cmd = (uint32_t)pwm_phase_count;
+        tbphs4_cmd = (uint32_t)pwm_phase_count;
+        phsdir_cmd = pwm_phase_direction;
+    }
+#endif
+
+}
